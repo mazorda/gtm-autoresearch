@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased — evaluator version 2
+## Unreleased — scoring-refresh report
+
+- Added historical search followed by frozen-candidate comparison on later, mature outcomes.
+- Added configurable primary-gain, tier-movement and segment-regression review gates.
+- Added Markdown/JSON reports, per-account score-change explanations and run manifests.
+- Added a synthetic health-score walkthrough demonstrating a historical winner that fails later.
+- Added public sample report, input-contract guide and community pilot invitation draft.
+- No production promotion, outreach or client-specific data changes.
+
+## Evaluator version 2 — merged in PR #1
 
 ### Fixed
 - Revenue Capture @20% selects an exact-size bucket, including when scores tie.

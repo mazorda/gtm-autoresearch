@@ -1,21 +1,23 @@
 # Roadmap
 
-## 1. Correctness foundation — implemented locally, unreleased
+## 1. Correctness foundation — merged in PR #1
 
 Exact-size revenue capture; integer mutation fix; strict data validation; accurate
 metric names/docs; seeds; isolated output directories; regression tests and CI.
 
-## 2. Reproducible refresh and promotion workflow — next
+## 2. Refresh report and public example — implemented, pending publication
 
-- Run IDs and fingerprints for dataset, complete spec, evaluator and dependencies.
-- Review only compatible runs; retain the initial spec and baseline as first-class artifacts.
-- Time-based evaluation with mature outcomes and a final untouched evaluation set.
-- A before/after report: primary and secondary metrics, tier transitions, missingness,
-  source freshness, instrumentation coverage and independent reference-set overlap.
-- Explicit candidate/promotion decisions with configurable business constraints.
-  Fixed percentage-point thresholds are not statistical significance tests.
-- A sanitized production-learnings guide using synthetic reproductions of schema
-  drift, mixed revenue units, incomplete tracking and silent score-definition changes.
+Implemented: temporal outcome checks, search-only optimization, frozen-candidate
+comparison, primary/tier/segment gates, per-account arithmetic explanations, feature
+drift summaries, run/input/spec/code fingerprints, and a synthetic end-to-end example.
+See [the refresh guide](docs/scoring-refresh.md).
+
+Still planned: source freshness and instrumentation-coverage contracts, reference-set
+overlap, uncertainty intervals, and comparisons across compatible run histories.
+The report marks these limits explicitly and does not promote production weights.
+
+Community next step: three to five volunteer testers using the
+[pilot invitation and feedback guide](docs/community-pilot.md).
 
 ## 3. Bounded agent workflow — later
 
