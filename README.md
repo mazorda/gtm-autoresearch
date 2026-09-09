@@ -7,6 +7,21 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch).
 The mutable artifact here is a JSON scoring spec. The default optimizer is integer
 weight hill-climbing; no LLM or production-system access is required.
 
+## Should you replace your current score?
+
+The new [scoring-refresh workflow](docs/scoring-refresh.md) searches historical
+outcomes, freezes a candidate, and compares it with your incumbent on later outcomes.
+It produces a readable report with tier movement, segment checks, account-level
+explanations and fingerprints of the data, specs and code.
+
+Start with the [synthetic walkthrough](examples/scoring_refresh/README.md), or read
+its [sample report](examples/scoring_refresh/sample-report.md). The example finds a
+historical improvement that fails on later outcomes, so the report says to keep the
+incumbent. All example data is synthetic.
+
+The report supports review; it does not automatically promote weights. Source
+freshness/coverage and statistical uncertainty still need operator review.
+
 ## September 2026 update — evaluation reliability
 
 This update brings lessons from real scoring refreshes into the engine: handle tied
@@ -139,8 +154,8 @@ are not implemented. See [metric definitions](docs/metrics.md).
 The current engine searches and reports on the same dataset. A higher score is an
 **in-sample improvement**, not evidence of future performance or incremental revenue.
 Use features observed before the outcome window and mature outcome labels. Before
-promotion, evaluate the frozen candidate on untouched future outcomes outside this
-loop. Do not tune repeatedly against that final evaluation set.
+promotion, evaluate the frozen candidate on untouched future outcomes using the
+[refresh workflow](docs/scoring-refresh.md) or your own external evaluation. Do not tune repeatedly against that final evaluation set.
 
 Data freshness and instrumentation coverage must be checked upstream. An untracked
 action is unknown, not automatically zero activity. Keep fit, health, expansion,
