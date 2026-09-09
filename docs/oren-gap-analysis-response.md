@@ -4,6 +4,10 @@
 **To:** Oren & team
 **Date:** April 2026
 
+> Historical response. Claims below about 13 implemented metrics, statistical
+> validation and search throughput predate the evaluator-v2 review. For current
+> capabilities and limitations, see [metrics.md](metrics.md) and [the README](../README.md).
+
 Oren - this is brilliant. Genuinely one of the most useful pieces of feedback we've had on the repo. Your team clearly knows what they're doing on the ICP side and this surfaced real things we need to fix. Here's our take - what landed, where we'd push back, and what we're changing.
 
 ---

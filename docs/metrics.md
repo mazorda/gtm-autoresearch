@@ -1,58 +1,87 @@
-# Evaluation Metrics
+# Evaluation metrics — version 2
 
-Every metric in the evaluator is something a RevOps or CS team uses to make resource allocation decisions. MLflow tracks loss curves. We track revenue retention by tier.
+The engine optimizes one scalar objective and reports other available metrics.
+Reported metrics do not act as automatic promotion constraints.
 
-## Primary metrics (optimize for one)
+## Optimization objectives
 
 ### Revenue Capture @20%
-What percentage of total MRR sits in the top 20% of scored accounts? Random scoring = 20%. A good model concentrates revenue in the top tier.
 
-### AUC-ROC (Retention / Churn)
-Binary classification accuracy. Can the score separate accounts that retained from those that churned? 0.5 = random, 0.7+ = useful, 0.8+ = strong.
+Among accounts with positive MRR, select exactly `ceil(0.2 * n)` accounts by
+descending score. Equal scores retain input row order. Divide selected MRR by all
+positive MRR. The selected count is also reported. For small samples the ceiling
+means the selected fraction can exceed 20%.
 
-## GTM-native metrics (reported, not optimized)
+Never break ties using the revenue target itself. Use a stable account-ID order
+upstream. Ties can still make results order-dependent. With identical revenue and
+100 tied accounts, capture is 20%, not the 100% returned by the old implementation.
+For heterogeneous revenue, random ordering captures the selected population fraction
+in expectation; any one ordering may differ.
 
-### NRR by tier (Net Revenue Retention)
-For each scoring tier: what percentage of starting MRR is retained after N months? Includes expansion. The metric that drives SaaS valuations.
+Supply nonnegative monthly-normalized recurring revenue. Missing MRR causes revenue
+metrics to be omitted and makes revenue-capture optimization fail. This is revenue
+concentration at the supplied snapshot, not a forecast or incremental revenue lift.
 
-Benchmark: healthy B2B SaaS targets 100-120%+ annual NRR.
+### AUC-ROC: retention and churn
 
-### GRR by tier (Gross Revenue Retention)
-Same as NRR but excludes expansion. Pure retention signal - no upsell masking.
-
-Benchmark: 85-95% annual for healthy B2B SaaS.
-
-### Logo retention by tier
-Percentage of accounts (not revenue) retained. Catches cases where many small accounts churn but large accounts mask it in NRR.
-
-### Expansion rate by tier
-Percentage of retained accounts that increased their MRR. Validates that the score predicts growth potential, not just retention.
-
-### Contraction rate by tier
-Percentage of retained accounts that decreased their MRR. Catches the "A-tier paradox" - high logo retention but dropping revenue due to plan downgrades.
-
-### Quick ratio by tier
-Expansion / (Churn + Contraction) per tier. Growth efficiency metric. Tells you where to invest CS and sales resources.
-
-### Winback rate by former tier
-Of churned accounts, what percentage came back - segmented by their tier BEFORE churning? Validates the score's predictive value beyond the active lifecycle.
-
-### Activation rate by tier
-Percentage of accounts that hit a product milestone, by tier. Links scoring to time-to-value.
-
-### ARPA by tier
-Average Revenue Per Account per tier. Guardrail: if ARPA is the same across tiers, the model might just be sorting by MRR instead of behavior.
-
-## Guardrails (constraints, not objectives)
+Rank discrimination for binary outcomes; this is not classification accuracy.
+Retention uses scores, churn uses negative scores (higher score means healthier).
+Requires more than 100 observations, both 0/1 classes, and scikit-learn.
+Undefined primary objectives cause an error before any experiment is written.
 
 ### Tier separation
-LTV ratio between top-quartile and bottom-quartile scored accounts. Should be > 2.0. If it's close to 1.0, the score isn't differentiating.
 
-### Revenue concentration (Herfindahl Index)
-HHI = sum of (tier MRR share)^2. Range: 2000 (evenly distributed across 5 tiers) to 10000 (all revenue in one tier).
+Among positive-LTV accounts, divide mean LTV for scores >= the 75th percentile by
+mean LTV for scores <= the 25th percentile. Requires more than 50 positive-LTV
+accounts. These percentile buckets include ties and may overlap for flat scores;
+a flat score therefore produces separation 1.0. This is distinct from exact-size
+revenue-capture selection.
 
-- HHI < 2500: well distributed
-- HHI 2500-4000: moderate concentration
-- HHI > 4000: one tier dominates - the model may just be learning "high MRR = high score"
+## Reported metrics
 
-This is the key guardrail against proxy metric gaming. A model that "improves" Revenue Capture by concentrating everything in one tier will trigger a high HHI warning.
+### Revenue-weighted binary retention by tier
+
+`sum(mrr for retained accounts in tier) / sum(mrr in tier)`.
+Requires the retention label and positive revenue in the dataset. Tiers require
+more than 10 rows; zero-revenue tiers return null. This weights binary retention by
+the supplied MRR snapshot. It does not measure expansion or contraction and must
+not be labeled NRR or GRR. For starting-revenue weighting, supply starting MRR.
+
+### Logo retention by tier
+
+Mean binary retention label in each tier with more than 10 rows.
+
+### Revenue concentration HHI
+
+`sum((100 * tier_revenue / total_revenue) ** 2)` across configured tiers. With K
+exhaustive tiers, the minimum is `10000 / K`, and maximum is 10000. Four equally
+weighted tiers yield 2500. This measures concentration across tiers, not account
+concentration. It is a diagnostic, not proof of metric gaming or an enforced gate.
+
+### ARPA by tier
+
+Mean MRR among positive-MRR accounts in each tier.
+
+### Distribution diagnostics
+
+Score mean and standard deviation, scored count, and `pct_<label>_tier` fractions.
+Configure non-overlapping tier intervals covering `[0, max_score]`. Tier bounds
+are minimum-inclusive and maximum-exclusive. The engine initializes unmatched rows
+to D, so custom tiers must cover the complete scoring range deliberately.
+
+## Not implemented
+
+True NRR and GRR need aligned starting/ending recurring revenue for the same cohort,
+including expansion, contraction and churn. Expansion rate, contraction rate, quick
+ratio, winback rate, and activation rate are not implemented either. Earlier docs
+listed these as available; that claim was incorrect.
+
+## Interpretation and migration
+
+Evaluator version 2 fixes revenue-capture tie handling and removes the misleading
+`nrr_by_tier` / `grr_by_tier` keys. Do not compare its outputs directly to old journals.
+Re-evaluate incumbent and candidate on the same data and evaluator. Existing journal
+files are preserved, never rewritten.
+
+All optimization results are in-sample. Use an untouched final evaluation period
+before promotion, and inspect secondary metrics and cohort changes separately.

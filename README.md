@@ -1,291 +1,177 @@
 # gtm-autoresearch
 
-**Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) loop, adapted for SaaS scoring models.**
+Reproducible experiments for interpretable GTM scoring models: change feature
+weights, evaluate the result, keep improvements, and record every evaluated candidate.
 
-[![Based on](https://img.shields.io/badge/Based_on-Karpathy's_Autoresearch-orange)](https://github.com/karpathy/autoresearch)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-green.svg)](https://python.org)
+Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch).
+The mutable artifact here is a JSON scoring spec. The default optimizer is integer
+weight hill-climbing; no LLM or production-system access is required.
 
-> Karpathy's autoresearch runs an AI agent that edits training code, measures validation loss, keeps improvements, and repeats - hundreds of experiments overnight on a single GPU. We took the same loop and pointed it at GTM scoring models: health scores, churn risk, ICP fit. Instead of `val_bpb`, we optimize for revenue retention by tier. Instead of 5-minute GPU runs, we score 5,000 accounts in 56ms. The constraints are the same: one mutable artifact, one metric, keep-or-revert, log everything.
+## September 2026 update — evaluation reliability
 
----
+This update brings lessons from real scoring refreshes into the engine: handle tied
+scores correctly, stop on broken inputs, and make experiments easier to reproduce.
+
+- **Correct revenue capture:** tied scores no longer inflate the top-20% population.
+- **Better weight exploration:** zero and small weights can move during search.
+- **Explicit data checks:** missing features, invalid outcomes and malformed values
+  stop a run instead of silently changing its meaning.
+- **Reproducible runs:** use `--seed` and a separate `--output-dir` for each experiment session.
+- **Accurate metric definitions:** revenue-weighted binary retention is labeled
+  correctly; true NRR/GRR are not yet implemented.
+- **Regression coverage:** synthetic tests cover these failure modes; GitHub Actions
+  is configured to test Python 3.9 and 3.12.
+
+**Upgrading:** recompute historical revenue-capture baselines and update consumers
+of the old `nrr_by_tier` / `grr_by_tier` fields. See the [migration notes](#migration-evaluator-version-2)
+and [changelog](CHANGELOG.md).
 
 ## Why this exists
 
-SaaS teams change their scoring models constantly — but almost nobody logs these changes as experiments. In ML that's malpractice. In GTM scoring it's standard practice.
+GTM teams regularly adjust health, engagement, and ICP scores without recording
+what changed or checking whether the new version performs better. This engine
+makes those changes inspectable and reversible through weight snapshots and an
+append-only experiment journal.
 
-A typical workflow:
-1. VP of CS says "we should weight NPS higher"
-2. Someone updates a config in Gainsight or a spreadsheet
-3. Nobody records what the old weights were
-4. Nobody measures if the change improved prediction
-5. Three months later, another tweak on top
-6. Nobody can tell which version was best
-
-This is the equivalent of editing `train.py`, never committing, and deleting your terminal history.
-
-Most teams already experiment with their scoring models — they build geo-specific variants, test different feature sets, validate against revenue. The problem isn't a lack of experimentation. It's a lack of **memory**. Every weight change is a lost experiment because nobody logs what was tried, what it replaced, or whether it actually worked.
-
-**gtm-autoresearch** adds the memory layer. Every weight change becomes a logged, comparable, reversible experiment. The engine finds better weights and proves they work — and the journal means the next experiment learns from all the previous ones instead of starting blind.
-
-## Where this fits
-
-```
-┌─────────────────────────────────────────────┐
-│  Channel Execution Layer                    │
-│  Campaign variants, HOTL governance,        │
-│  multi-agent orchestration, API execution   │
-│  → Described in the playbook (see Related)  │
-├─────────────────────────────────────────────┤
-│  Experiment Engine (THIS REPO)              │
-│  Weight optimization, experiment journal,   │
-│  13 GTM-native metrics, keep-or-revert     │
-├─────────────────────────────────────────────┤
-│  Your ICP Foundation                        │
-│  Scoring model, enrichment pipeline,        │
-│  segmentation, ground truth data            │
-│  → You build this (or already have it)      │
-└─────────────────────────────────────────────┘
-```
-
-The bottom layer is the hardest to build and the most defensible - your ICP model, your enrichment pipeline, your ground truth. This repo sits in the middle: it takes your foundation and adds experiment discipline. The channel execution layer (running campaign variants, A/B tests on email/ads/pages) sits above and is described in the [playbook](https://mazorda.com/playbooks/autonomous-gtm-experimentation), not this repo.
-
-## What this repo does NOT do
-
-- **Send emails or run ad campaigns.** This optimizes scoring models, not campaign assets.
-- **Replace your ICP model.** You need a scoring foundation with features and known outcomes first. This makes it better.
-- **Require an LLM.** Mutations are random weight perturbations - cheap, fast, and sufficient for the weight-space search.
-- **Touch your production systems.** The engine reads data, runs experiments in memory, and writes to a journal file. Nothing else.
-
----
-
-## How it maps to Karpathy's design
-
-The original [autoresearch](https://github.com/karpathy/autoresearch) is a 630-line Python harness built around three constraints: one mutable file (`train.py`), one evaluation metric (`val_bpb`), and a keep-or-revert rule enforced by git. The agent runs hundreds of experiments overnight, each bounded to 5 minutes on a single GPU.
-
-We preserved the constraints. We changed what they operate on.
-
-| Karpathy's autoresearch | gtm-autoresearch |
-|---|---|
-| **Mutable artifact:** `train.py` (GPT training code) | **Mutable artifact:** scoring spec (feature weights) |
-| **Experiment:** 5-min GPU training run | **Experiment:** score all accounts (56ms for 5K) |
-| **Metric:** `val_bpb` (bits per byte) | **Metric:** AUC-ROC, Revenue Capture, NRR by tier |
-| **Mutation:** AI edits Python code | **Mutation:** random weight perturbation |
-| **Rollback:** `git reset` | **Rollback:** keep-or-revert (journal preserves all) |
-| **Budget:** 1 GPU, 5 min/experiment | **Budget:** 1 CPU, <100ms/experiment |
-| **Scale:** ~100 experiments/day | **Scale:** ~500 experiments/second |
-| **Evaluation:** single scalar (val_bpb) | **Evaluation:** 13 GTM-native metrics (NRR, GRR, HHI...) |
-
-### What we kept from Karpathy
-
-1. **The evaluation harness is read-only.** The loop can change weights. It cannot change how results are measured. This is the core governance constraint that prevents metric gaming.
-2. **Every experiment is logged.** Append-only journal. Full weight snapshots. Reproducible.
-3. **Keep-or-revert discipline.** Only improvements survive.
-4. **Speed enables exploration.** Karpathy's insight: the loop must be fast enough to run hundreds of experiments, not dozens. We vectorized scoring in numpy to hit 300-500/second.
-5. **Features are frozen during runs.** Adding features is a human decision outside the loop. The agent optimizes weights on a fixed set.
-
-### What we changed for GTM
-
-1. **Multi-metric evaluation.** Karpathy uses one scalar. GTM scoring needs NRR, churn prediction, expansion rate, and fairness across segments - simultaneously. We optimize one primary metric but report all 13 so humans can catch proxy drift.
-2. **GTM-native metrics.** Net Revenue Retention by tier, winback rate by former tier, revenue concentration (HHI). These are what RevOps teams use to make resource decisions. MLflow doesn't know what NRR is.
-3. **No LLM required.** Karpathy's agents use LLMs to edit code. Our mutations are random weight perturbations - cheap, fast, and sufficient for the weight-space search. The search space (15-25 features, integer weights 0-25) is small enough that random hill-climbing explores it thoroughly in minutes.
-
-## Validated results
-
-### Test A: Synthetic signal recovery
-
-Generated 5,000 accounts with **known planted signals** (some features predict retention, others are noise). Ran 2,000 experiments in 6.8 seconds. The engine recovered all planted signals in the correct rank order:
-
-| Signal | Planted strength | Engine found | Recovered? |
-|---|---|---|---|
-| alert_created | Strongest | Weight 25 (highest) | Yes |
-| session_depth | 2nd | Weight 23 | Yes |
-| activation_speed | 3rd | Weight 20 | Yes |
-| has_exported | Moderate | Weight 10 | Yes |
-| credit_limit_hits | Weak positive | Weight 6 (positive) | Yes |
-| noise_feature_1 | Zero | Weight 1 (near zero) | Yes |
-| noise_feature_2 | Zero | Weight 1 (near zero) | Yes |
-
-**AUC-ROC:** 0.63 -> 0.75 | **Tier separation:** 1.38 -> 1.85 | **Time:** 6.8 seconds
-
-```
-# Reproduce this yourself:
-python3 examples/health_score/generate_data.py
-python3 engine/scoring_engine.py --n 2000 --metric auc_roc_retain
-```
-
-### Test B: Production validation
-
-Also tested against a production B2B SaaS dataset (tens of thousands of accounts, multiple data sources, known retention and revenue outcomes). The engine found signal hierarchies that manual weight-tuning missed - including cases where signals assumed to be negative (user friction events) turned out to be strong positive engagement indicators. Details available on request.
+You provide the features, outcome definitions, and scoring assumptions. The engine
+optimizes a fixed feature set against one objective. Campaign execution and production
+promotion remain outside the engine.
 
 ## Quick start
 
-### Option A: Run on your own data (recommended)
-
-If you already have account data with known outcomes (retention, churn, revenue):
+Requires Python 3.9+.
 
 ```bash
-# 1. Prepare a parquet file with columns: your scoring features + outcomes
-#    Required outcome columns (at least one): retained_6mo, churned, actual_ltv, mrr
-#    Feature columns: everything else (the engine auto-detects them)
-
-# 2. Run 2,000 experiments (~7 seconds)
-python3 engine/scoring_engine.py --n 2000 --metric revenue_capture_at_20 --data your_ground_truth.parquet
-
-# 3. Review what the engine found
-python3 analysis/review.py experiment_journal.jsonl
-```
-
-### Option B: Try with synthetic data first
-
-No data yet? Generate a test dataset with planted signals to see how the engine works:
-
-```bash
-# 1. Generate synthetic data (5K accounts, planted signals)
+python3 -m pip install -r requirements.txt
 python3 examples/health_score/generate_data.py
-
-# 2. Run 2,000 experiments (~7 seconds)
-python3 engine/scoring_engine.py --n 2000 --metric auc_roc_retain
-
-# 3. Review results - the engine should recover all planted signals
-python3 analysis/review.py experiment_journal.jsonl
-
-# 4. Run validation tests
-python3 tests/test_engine.py
-```
-
-## How it works
-
-### 1. Define a scoring spec
-
-```yaml
-model: health_score
-max_score: 100
-
-features:
-  alert_created:
-    weight: 5       # Starting weight (the engine will optimize this)
-    min: 0
-    max: 25
-  session_depth:
-    weight: 5
-    min: 0
-    max: 25
-  # ... your features
-
-tiers:
-  A: {min: 60, max: 101}
-  B: {min: 35, max: 60}
-  C: {min: 15, max: 35}
-  D: {min: 0, max: 15}
-```
-
-Or skip the spec - the engine auto-detects features from your parquet columns.
-
-### 2. Prepare ground truth
-
-A parquet file with one row per account. Columns: features + outcomes (`retained_6mo`, `churned`, `actual_ltv`, `mrr`).
-
-### 3. Run experiments
-
-```bash
 python3 engine/scoring_engine.py \
-    --n 2000 \
-    --metric auc_roc_retain \
-    --data your_ground_truth.parquet
+  --data synthetic_ground_truth.parquet \
+  --metric auc_roc_retain --n 2000 --seed 42 \
+  --output-dir runs/health-demo
+python3 analysis/review.py runs/health-demo/experiment_journal.jsonl
 ```
 
-Available metrics: `auc_roc_retain`, `auc_roc_churn`, `revenue_capture_at_20`, `tier_separation`
+Outputs: `experiment_journal.jsonl` and `best_spec.json`. Use a **new output directory
+for each run**, especially after changing data or evaluation objectives. The review
+command rejects mixed objectives or evaluator versions; it does not yet fingerprint
+datasets, so directories are the boundary between datasets.
 
-### 4. Review the journal
+`--seed` reproduces mutation choices. Replaying requires the same data **in the same
+row order**, spec, engine and dependency versions. Timestamps and durations will differ.
+The journal records the seed and evaluator version.
 
-Every experiment produces a JSONL entry:
+## Bring your own data
+
+Supply a parquet file with one row per account, numeric scoring features, and the
+outcome needed by your chosen metric. Prefer an explicit JSON spec:
 
 ```json
 {
-  "experiment_id": "exp_00034",
-  "metric": "auc_roc_retain",
-  "baseline_value": 0.6492,
-  "variant_value": 0.6610,
-  "outcome": "win",
-  "changes": ["alert_created: 5 -> 12", "session_depth: 5 -> 8"],
-  "weights_snapshot": {"alert_created": 12, "session_depth": 8},
-  "metrics": {
-    "auc_roc_retain": 0.6610,
-    "nrr_by_tier": {"A": 1.0, "B": 0.92, "C": 0.59, "D": 0.32},
-    "revenue_concentration_hhi": 3953
+  "model": "health_score",
+  "max_score": 100,
+  "mrr_column": "mrr_normalized",
+  "required_columns": ["account_id"],
+  "features": {
+    "alert_created": {"weight": 5, "min": 0, "max": 25},
+    "session_depth": {"weight": 5, "min": 0, "max": 25}
+  },
+  "tiers": {
+    "A": {"min": 60, "max": 101},
+    "B": {"min": 35, "max": 60},
+    "C": {"min": 15, "max": 35},
+    "D": {"min": 0, "max": 15}
   }
 }
 ```
 
-## GTM-native evaluation metrics
+```bash
+python3 engine/scoring_engine.py \
+  --data your_ground_truth.parquet --spec your_spec.json \
+  --metric revenue_capture_at_20 --n 2000 --seed 42 \
+  --output-dir runs/customer-refresh-001
+```
 
-This is what separates it from MLflow or generic experiment tracking. Every metric here is something a RevOps or CS team uses to make resource allocation decisions.
+- All named features and the selected metric's outcome column are required.
+- `required_columns` can additionally require identifiers or other upstream fields.
+- Features and present outcome columns must contain finite numeric values. Missing
+  or malformed values cause an error; they are never silently filled with zero.
+- Retention/churn labels must be 0/1. AUC requires more than 100 rows and both classes.
+- MRR must be nonnegative and normalized to a common monthly basis upstream. The
+  engine cannot infer whether a number is monthly or annual revenue.
+- Revenue capture requires positive revenue. Tier separation requires more than 50
+  positive-LTV accounts. An unavailable primary metric stops the run before output.
+- Outcome columns cannot also be features. Other leakage, such as future revenue
+  under a different name, must be checked upstream.
+- Weights and bounds are integers. Features should be scaled deliberately; scoring
+  is a weighted sum clipped to `[0, max_score]`.
 
-| Metric | What it answers |
+Optional outcome mappings: `retain_column`, `churn_column`, `ltv_column`.
+Without a spec, the engine treats every column except `account_id`, `email`, `mrr`,
+`retained_6mo`, `churned`, `actual_ltv`, and `tenure_months` as a feature. Use an explicit
+spec for real datasets containing dates, metadata, or custom outcome names.
+
+## Implemented metrics
+
+| Metric | Meaning |
 |---|---|
-| **NRR by tier** | Do higher-scored accounts retain more revenue? |
-| **GRR by tier** | Pure retention without expansion masking it |
-| **Logo retention by tier** | Account count retention (not revenue-weighted) |
-| **Expansion rate by tier** | Do higher-scored accounts upsell? |
-| **Contraction rate by tier** | Who's downgrading? (catches the "retain logo, lose revenue" pattern) |
-| **Quick ratio by tier** | Growth efficiency per segment |
-| **Winback rate by former tier** | Do historically high-scored churned accounts return? |
-| **Activation rate by tier** | Do higher tiers activate faster? |
-| **ARPA by tier** | Are tiers just proxies for plan price? |
-| **Revenue concentration (HHI)** | Is too much MRR in one tier? (guardrail against gaming) |
-| **Revenue Capture @20%** | Does the top 20% of scored accounts contain the most revenue? |
-| **AUC-ROC** | Binary classification accuracy for retention/churn |
-| **Tier separation** | LTV ratio between top and bottom quartiles |
+| Revenue Capture @20% | Revenue share in exactly `ceil(0.2 × positive-MRR accounts)` selected accounts |
+| AUC-ROC, retention/churn | How well score rankings distinguish binary outcomes |
+| Revenue-weighted binary retention by tier | Share of supplied MRR belonging to accounts labeled retained; **not NRR or GRR** |
+| Logo retention by tier | Mean retention label in each tier |
+| Tier separation | Mean positive LTV above the score's 75th percentile divided by that below its 25th percentile |
+| Revenue concentration HHI | Concentration of revenue across scoring tiers |
+| ARPA by tier | Mean positive MRR in each tier |
+| Score and tier distribution | Mean/std of scores and fraction in each tier |
 
-See [docs/metrics.md](docs/metrics.md) for detailed definitions and benchmarks.
+Optimization choices: `revenue_capture_at_20`, `auc_roc_retain`, `auc_roc_churn`,
+`tier_separation`. Other metrics are reports, **not enforced promotion gates**.
 
-## Architecture
+Revenue-capture ties are broken by input row order, never by revenue. Sort by a
+stable account identifier before creating parquet for reproducible tie handling.
+The result depends on that tie order; compare against a random baseline when many
+accounts tie. Unlike revenue capture, tier-separation percentile buckets include ties.
 
+True NRR/GRR, expansion, contraction, quick ratio, winback, and activation metrics
+are not implemented. See [metric definitions](docs/metrics.md).
+
+## Evaluation limits
+
+The current engine searches and reports on the same dataset. A higher score is an
+**in-sample improvement**, not evidence of future performance or incremental revenue.
+Use features observed before the outcome window and mature outcome labels. Before
+promotion, evaluate the frozen candidate on untouched future outcomes outside this
+loop. Do not tune repeatedly against that final evaluation set.
+
+Data freshness and instrumentation coverage must be checked upstream. An untracked
+action is unknown, not automatically zero activity. Keep fit, health, expansion,
+and winback objectives separate and choose the target for the operational decision.
+
+## Migration: evaluator version 2
+
+- Revenue capture now selects an exact-size bucket. Previously, ties could select
+  the entire population and report 100% capture. Recompute old baselines before comparison.
+- `nrr_by_tier` and `grr_by_tier` are replaced by
+  `revenue_weighted_retention_by_tier`. Update downstream consumers.
+- Invalid data and unavailable objectives now fail instead of silently degrading.
+- Zero and small weights can now move under the default mutation strategy.
+- Historical performance claims need rerunning under the corrected evaluator.
+
+See [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
+
+## Development
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest tests -q
 ```
-gtm-autoresearch/
-├── README.md
-├── LICENSE
-├── engine/
-│   └── scoring_engine.py    # Core: score + evaluate + experiment loop
-├── analysis/
-│   └── review.py            # Journal analysis + comparison
-├── examples/
-│   ├── health_score/
-│   │   └── generate_data.py # Synthetic data: retention signals
-│   └── churn_risk/
-│       └── generate_data.py # Synthetic data: churn decay signals
-├── spec/
-│   └── example_spec.json    # Example scoring spec (output of a run)
-├── docs/
-│   ├── methodology.md       # Full Karpathy adaptation explained
-│   └── metrics.md           # All 13 evaluation metrics defined
-└── tests/
-    └── test_engine.py       # 4 validation tests including signal recovery
-```
 
-## Requirements
-
-- Python 3.9+
-- numpy, pandas, pyarrow
-- scikit-learn (for AUC-ROC)
-
-## License
-
-MIT
+Tests use synthetic data and temporary output directories. CI runs the suite on
+Python 3.9 and 3.12.
 
 ## Related
 
-- [Autonomous GTM Experimentation](https://mazorda.com/playbooks/autonomous-gtm-experimentation) - the Mazorda playbook that explains when and how to apply this pattern
-- [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) - the original ML experimentation loop this project is based on
+- [Methodology](docs/methodology.md)
+- [Autonomous GTM Experimentation playbook](https://mazorda.com/playbooks/autonomous-gtm-experimentation)
+- [Karpathy's autoresearch](https://github.com/karpathy/autoresearch)
 
-## Credits
-
-- **[Andrej Karpathy](https://github.com/karpathy)** - for [autoresearch](https://github.com/karpathy/autoresearch), the autonomous experiment loop that this project adapts for GTM
-- **[Anthropic](https://anthropic.com)** - for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), used throughout development
-
-## Author
-
-**[Yaniv Mazor](https://mazorda.com)** - Founder, Mazorda. GTM engineering for B2B SaaS.
-
-Built from production work with real SaaS account data. The pattern is reusable for any SaaS company with behavioral data and known outcomes.
+MIT licensed.
