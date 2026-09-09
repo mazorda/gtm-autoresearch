@@ -11,6 +11,7 @@ Usage:
 import argparse
 import copy
 import json
+import math
 import random
 import time
 from datetime import datetime, timezone
@@ -26,11 +27,7 @@ JOURNAL_PATH = Path(__file__).parent.parent / "experiment_journal.jsonl"
 
 def load_ground_truth(path: str) -> pd.DataFrame:
     """Load ground truth from parquet."""
-    df = pq.read_table(path).to_pandas()
-    for col in df.columns:
-        if col not in ["account_id", "email"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return df
+    return pq.read_table(path).to_pandas()
 
 
 def load_spec(path: str) -> dict:
@@ -39,15 +36,64 @@ def load_spec(path: str) -> dict:
         return json.load(f)
 
 
+def validate_inputs(df: pd.DataFrame, spec: dict, metric: str) -> pd.DataFrame:
+    """Validate the data contract once, before any experiment or output write.
+
+    Missing observations must be resolved explicitly upstream, never turned into
+    evidence of inactivity or a negative outcome by this loader.
+    """
+    if df.empty:
+        raise ValueError("Ground truth must contain at least one account")
+    features = spec.get("features", {})
+    if not features:
+        raise ValueError("Scoring spec must define at least one feature")
+    outcomes = {
+        "revenue_capture_at_20": spec.get("mrr_column", "mrr"),
+        "auc_roc_retain": spec.get("retain_column", "retained_6mo"),
+        "auc_roc_churn": spec.get("churn_column", "churned"),
+        "tier_separation": spec.get("ltv_column", "actual_ltv"),
+    }
+    if metric not in outcomes:
+        raise ValueError(f"Unknown primary metric: {metric}")
+    required = set(features) | set(spec.get("required_columns", [])) | {outcomes[metric]}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+    if set(features) & set(outcomes.values()):
+        raise ValueError("Outcome columns cannot also be scoring features")
+    result = df.copy()
+    numeric = set(features) | (set(outcomes.values()) & set(df.columns))
+    for col in sorted(numeric):
+        values = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Column {col!r} contains missing, nonnumeric or infinite values; resolve upstream")
+        result[col] = values
+    for key in ("auc_roc_retain", "auc_roc_churn"):
+        col = outcomes[key]
+        if col in result and not result[col].isin([0, 1]).all():
+            raise ValueError(f"Outcome {col!r} must contain only binary 0/1 labels")
+    mrr_col = outcomes["revenue_capture_at_20"]
+    if mrr_col in result and (result[mrr_col] < 0).any():
+        raise ValueError(f"Revenue column {mrr_col!r} must be nonnegative normalized recurring revenue")
+    for name, definition in features.items():
+        weight = definition["weight"]
+        lo, hi = definition.get("min", -5), definition.get("max", 25)
+        if not all(type(v) is int
+                   for v in (weight, lo, hi)) or not lo <= weight <= hi:
+            raise ValueError(f"Feature {name!r} needs integer weight and bounds with min <= weight <= max")
+    if not math.isfinite(spec.get("max_score", 100)) or spec.get("max_score", 100) <= 0:
+        raise ValueError("max_score must be positive and finite")
+    return result
+
+
 def score_vectorized(df: pd.DataFrame, spec: dict) -> np.ndarray:
     """Vectorized scoring. Returns array of scores."""
     features = spec["features"]
     scores = np.zeros(len(df))
 
     for feat_name, feat_def in features.items():
-        if feat_name in df.columns:
-            w = feat_def["weight"]
-            scores += df[feat_name].values * w
+        w = feat_def["weight"]
+        scores += df[feat_name].values * w
 
     max_score = spec.get("max_score", 100)
     scores = np.clip(scores, 0, max_score)
@@ -70,7 +116,7 @@ def evaluate(df: pd.DataFrame, scores: np.ndarray, spec: dict) -> dict:
     churn_col = spec.get("churn_column", "churned")
     ltv_col = spec.get("ltv_column", "actual_ltv")
 
-    mrr = df[mrr_col].values if mrr_col in df.columns else np.ones(len(df))
+    mrr = df[mrr_col].values if mrr_col in df.columns else np.zeros(len(df))
     retain = df[retain_col].values if retain_col in df.columns else None
     churn = df[churn_col].values if churn_col in df.columns else None
     ltv = df[ltv_col].values if ltv_col in df.columns else None
@@ -78,8 +124,13 @@ def evaluate(df: pd.DataFrame, scores: np.ndarray, spec: dict) -> dict:
     # === PRIMARY: Revenue Capture @20% ===
     valid_mrr = mrr > 0
     if valid_mrr.sum() > 0:
-        threshold = np.percentile(scores[valid_mrr], 80)
-        top_mrr = mrr[(scores >= threshold) & valid_mrr].sum()
+        # Exact capacity: ceil(20% of positive-MRR accounts). Ties retain
+        # input order; never use revenue as a tie-breaker.
+        eligible = np.flatnonzero(valid_mrr)
+        k = max(1, math.ceil(len(eligible) * 0.2))
+        selected = eligible[np.argsort(-scores[eligible], kind="stable")[:k]]
+        top_mrr = mrr[selected].sum()
+        results["revenue_capture_selected_count"] = k
         total_mrr = mrr[valid_mrr].sum()
         results["revenue_capture_at_20"] = round(float(top_mrr / total_mrr), 4)
 
@@ -117,21 +168,16 @@ def evaluate(df: pd.DataFrame, scores: np.ndarray, spec: dict) -> dict:
         mask = (scores >= bounds["min"]) & (scores < bounds["max"])
         tiers[mask] = label
 
-    # === NRR BY TIER ===
+    # === REVENUE-WEIGHTED BINARY RETENTION (NOT NRR/GRR) ===
     if retain is not None and valid_mrr.sum() > 0:
-        nrr_by_tier = {}
+        revenue_weighted_retention_by_tier = {}
         for label in tier_config:
             mask = tiers == label
             if mask.sum() > 10:
                 start = mrr[mask].sum()
                 retained_mrr = mrr[mask & (retain == 1)].sum() if retain is not None else start
-                nrr_by_tier[label] = round(float(retained_mrr / start), 4) if start > 0 else None
-        results["nrr_by_tier"] = nrr_by_tier
-
-    # === GRR BY TIER ===
-    # GRR = retained revenue, capped at starting (no expansion credit)
-    # With synthetic data, this equals NRR. With real data, would differ.
-    results["grr_by_tier"] = results.get("nrr_by_tier", {})
+                revenue_weighted_retention_by_tier[label] = round(float(retained_mrr / start), 4) if start > 0 else None
+        results["revenue_weighted_retention_by_tier"] = revenue_weighted_retention_by_tier
 
     # === LOGO RETENTION BY TIER ===
     if retain is not None:
@@ -179,21 +225,27 @@ def evaluate(df: pd.DataFrame, scores: np.ndarray, spec: dict) -> dict:
     return results
 
 
-def random_mutate(spec: dict, n_changes: int = 2, magnitude: float = 0.3) -> dict:
+def random_mutate(spec: dict, n_changes: int = 2, magnitude: float = 0.3, rng=None) -> dict:
     """Mutate scoring weights."""
+    if magnitude <= 0 or not math.isfinite(magnitude):
+        raise ValueError("Mutation magnitude must be positive and finite")
+    rng = rng or random
     new = copy.deepcopy(spec)
     features = new["features"]
     names = list(features.keys())
     changes = []
 
-    for feat in random.sample(names, min(n_changes, len(names))):
+    for feat in rng.sample(names, min(n_changes, len(names))):
         fdef = features[feat]
         old_w = fdef["weight"]
         lo = fdef.get("min", -5)
         hi = fdef.get("max", 25)
 
-        delta = random.uniform(-magnitude * max(abs(old_w), 1), magnitude * max(abs(old_w), 1))
-        new_w = round(max(lo, min(hi, old_w + delta)))
+        # At least one integer step is reachable even from zero or +/-1.
+        radius = max(1, math.ceil(magnitude * max(abs(old_w), 1)))
+        candidates = [w for w in range(max(lo, old_w - radius), min(hi, old_w + radius) + 1)
+                      if w != old_w]
+        new_w = rng.choice(candidates) if candidates else old_w
 
         if new_w != old_w:
             fdef["weight"] = new_w
@@ -208,18 +260,23 @@ def random_mutate(spec: dict, n_changes: int = 2, magnitude: float = 0.3) -> dic
 
 def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at_20",
                      ground_truth_path: str = "synthetic_ground_truth.parquet",
-                     spec_path: str = None):
+                     spec_path: str = None, seed: int = None, output_dir: str = None):
     """Run the autoresearch loop."""
     print(f"\n{'='*60}")
     print(f"GTM AUTORESEARCH ENGINE")
     print(f"Metric: {metric} | Experiments: {n_experiments}")
     print(f"{'='*60}\n")
 
+    if n_experiments < 1:
+        raise ValueError("Number of experiments must be positive")
+    rng = random.Random(seed)
+    journal_path = Path(output_dir) / "experiment_journal.jsonl" if output_dir else JOURNAL_PATH
+    best_path = journal_path.parent / "best_spec.json"
     df = load_ground_truth(ground_truth_path)
     print(f"Loaded {len(df):,} accounts, {len(df.columns)} columns")
 
     # Load or create spec
-    if spec_path and Path(spec_path).exists():
+    if spec_path:
         spec = load_spec(spec_path)
     else:
         # Auto-detect features (exclude outcome columns and ID)
@@ -240,10 +297,12 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
         }
         print(f"Auto-detected {len(feature_cols)} features: {', '.join(feature_cols)}")
 
+    df = validate_inputs(df, spec, metric)
+
     # Load journal
     journal = []
-    if JOURNAL_PATH.exists():
-        with open(JOURNAL_PATH) as f:
+    if journal_path.exists():
+        with open(journal_path) as f:
             for line in f:
                 if line.strip():
                     journal.append(json.loads(line))
@@ -251,7 +310,10 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
     # Baseline
     baseline_scores = score_vectorized(df, spec)
     baseline_metrics = evaluate(df, baseline_scores, spec)
-    baseline_value = baseline_metrics.get(metric, 0)
+    if metric not in baseline_metrics or not np.isfinite(baseline_metrics[metric]):
+        raise ValueError(f"Primary metric {metric!r} is unavailable: check sample size, outcome variation and dependencies")
+    baseline_value = baseline_metrics[metric]
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Baseline {metric}: {baseline_value}")
     print(f"Score stats: mean={baseline_metrics['score_mean']}, std={baseline_metrics['score_std']}")
@@ -268,19 +330,21 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
         exp_id = f"exp_{len(journal) + 1:05d}"
         t0 = time.time()
 
-        hyp = random_mutate(best_spec, n_changes=random.choice([1, 2, 3]))
+        hyp = random_mutate(best_spec, n_changes=rng.choice([1, 2, 3]), rng=rng)
         if not hyp["changes"]:
             continue
 
         variant_scores = score_vectorized(df, hyp["spec"])
         variant_metrics = evaluate(df, variant_scores, hyp["spec"])
-        variant_value = variant_metrics.get(metric, 0)
+        variant_value = variant_metrics[metric]
 
         outcome = "win" if variant_value > best_value else "lose"
         dt = time.time() - t0
 
         entry = {
             "experiment_id": exp_id,
+            "seed": seed,
+            "evaluation_version": 2,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metric": metric,
             "baseline_value": round(best_value, 6),
@@ -294,7 +358,7 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
         }
 
         # Append to JSONL
-        with open(JOURNAL_PATH, "a") as f:
+        with open(journal_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
         journal.append(entry)
 
@@ -332,8 +396,8 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
         f = final_metrics.get(m, "?")
         print(f"  {m}: {b} -> {f}")
 
-    if "nrr_by_tier" in final_metrics:
-        print(f"\nNRR by tier: {final_metrics['nrr_by_tier']}")
+    if "revenue_weighted_retention_by_tier" in final_metrics:
+        print(f"\nRevenue-weighted binary retention by tier: {final_metrics['revenue_weighted_retention_by_tier']}")
     if "logo_retention_by_tier" in final_metrics:
         print(f"Logo retention by tier: {final_metrics['logo_retention_by_tier']}")
     if "arpa_by_tier" in final_metrics:
@@ -348,7 +412,7 @@ def run_autoresearch(n_experiments: int = 500, metric: str = "revenue_capture_at
         print(f"  {feat:25s} {w:>4d}{changed}")
 
     # Save best spec
-    with open(Path(__file__).parent.parent / "best_spec.json", "w") as f:
+    with open(best_path, "w") as f:
         json.dump(best_spec, f, indent=2)
 
     return best_spec, final_metrics
@@ -363,7 +427,10 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="synthetic_ground_truth.parquet",
                         help="Path to ground truth parquet")
     parser.add_argument("--spec", default=None, help="Path to scoring spec JSON")
+    parser.add_argument("--seed", type=int, help="Replay mutation choices with a fixed seed")
+    parser.add_argument("--output-dir", help="Directory for this run journal and best spec")
     args = parser.parse_args()
 
     run_autoresearch(n_experiments=args.n, metric=args.metric,
-                     ground_truth_path=args.data, spec_path=args.spec)
+                     ground_truth_path=args.data, spec_path=args.spec,
+                     seed=args.seed, output_dir=args.output_dir)

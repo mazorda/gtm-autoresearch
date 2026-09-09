@@ -21,13 +21,17 @@ def review(journal_path: str):
         print("Empty journal.")
         return
 
+    signatures = {(e.get("metric"), e.get("evaluation_version", 1)) for e in entries}
+    if len(signatures) != 1:
+        raise ValueError("Journal mixes objectives or evaluator versions; review separate run journals")
+
     wins = [e for e in entries if e["outcome"] == "win"]
     losses = [e for e in entries if e["outcome"] == "lose"]
 
     metric = entries[0].get("metric", "unknown")
     first_value = entries[0].get("baseline_value", 0)
     best = max(entries, key=lambda e: e.get("variant_value", 0))
-    best_value = best["variant_value"]
+    best_value = max(first_value, best["variant_value"])
 
     print(f"{'='*60}")
     print(f"EXPERIMENT JOURNAL REVIEW")
@@ -36,6 +40,11 @@ def review(journal_path: str):
     print(f"Wins: {len(wins)} ({100*len(wins)/len(entries):.1f}%)")
     print(f"Metric: {metric}")
     print(f"Start: {first_value:.4f} -> Best: {best_value:.4f} (+{best_value - first_value:.4f})")
+
+    # Never describe a losing candidate as the best spec.
+    if best["variant_value"] <= first_value:
+        print("No improvement over the starting baseline; keep the input spec.")
+        return
 
     # Best weights
     print(f"\nBest weights ({best['experiment_id']}):")
@@ -54,12 +63,13 @@ def review(journal_path: str):
         if last_win < len(entries) * 0.5:
             print(f"  Note: converged in first half - may benefit from more exploration")
 
-    # NRR by tier in best run
+    # Historical journals retain their original (legacy) labels.
     best_metrics = best.get("metrics", {})
-    if "nrr_by_tier" in best_metrics:
-        print(f"\nNRR by tier (best run):")
-        for tier, nrr in sorted(best_metrics["nrr_by_tier"].items()):
-            print(f"  {tier}: {nrr:.1%}")
+    retention = best_metrics.get("revenue_weighted_retention_by_tier", best_metrics.get("nrr_by_tier", {}))
+    if retention:
+        print("\nRevenue-weighted binary retention by tier (not NRR):")
+        for tier, value in sorted(retention.items()):
+            print(f"  {tier}: {value:.1%}" if value is not None else f"  {tier}: unavailable")
 
     if "logo_retention_by_tier" in best_metrics:
         print(f"\nLogo retention by tier (best run):")

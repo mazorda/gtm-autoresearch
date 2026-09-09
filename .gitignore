@@ -8,3 +8,6 @@ build/
 *.parquet
 experiment_journal.jsonl
 best_spec.json
+
+.pytest_cache/
+runs/

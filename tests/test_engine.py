@@ -73,13 +73,13 @@ def test_evaluate_returns_metrics():
     assert "n_scored" in metrics
     assert metrics["n_scored"] == len(df)
 
-    # NRR by tier should exist
-    if "nrr_by_tier" in metrics:
-        assert isinstance(metrics["nrr_by_tier"], dict)
-        # Higher tiers should have higher NRR
-        nrr = metrics["nrr_by_tier"]
+    # Revenue-weighted binary retention should exist
+    if "revenue_weighted_retention_by_tier" in metrics:
+        assert isinstance(metrics["revenue_weighted_retention_by_tier"], dict)
+        # Higher tiers should have higher weighted retention
+        nrr = metrics["revenue_weighted_retention_by_tier"]
         if "A" in nrr and "D" in nrr and nrr["A"] is not None and nrr["D"] is not None:
-            assert nrr["A"] >= nrr["D"], f"A-tier NRR ({nrr['A']}) should >= D-tier ({nrr['D']})"
+            assert nrr["A"] >= nrr["D"], f"A-tier weighted retention ({nrr['A']}) should >= D-tier ({nrr['D']})"
 
     print("  test_evaluate_returns_metrics: PASS")
 
@@ -111,11 +111,14 @@ def test_signal_recovery():
         df.to_parquet(f.name, index=False)
         data_path = f.name
 
-    best_spec, metrics = run_autoresearch(
-        n_experiments=500,
-        metric="auc_roc_retain",
-        ground_truth_path=data_path
-    )
+    with tempfile.TemporaryDirectory() as output_dir:
+        best_spec, metrics = run_autoresearch(
+            n_experiments=500,
+            metric="auc_roc_retain",
+            ground_truth_path=data_path,
+            seed=123,
+            output_dir=output_dir,
+        )
 
     weights = {k: v["weight"] for k, v in best_spec["features"].items()}
 
